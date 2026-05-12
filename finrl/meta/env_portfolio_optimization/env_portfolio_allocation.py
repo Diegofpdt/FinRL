@@ -202,10 +202,11 @@ class PortfolioAllocationEnv(gym.Env):
         return obs
 
     def step(self, action):
-        # Terminal check: not enough room to advance a full step
-        self._terminal = (self._time_index + self._step_size) >= len(self._sorted_times)
+        last_idx = len(self._sorted_times) - 1
 
-        if self._terminal:
+        # Terminal: already at the last tradeable day
+        if self._time_index >= last_idx:
+            self._terminal = True
             return self._handle_terminal()
 
         # Current prices at this time index
@@ -218,15 +219,15 @@ class PortfolioAllocationEnv(gym.Env):
         share_deltas = self._action_fix(action, prices)
         self._execute_trades(share_deltas, prices)
 
-        # Advance time and record a daily portfolio value for every day in the window.
-        # Holdings are fixed after the trade, so daily_pv = balance + sum(h * day_prices).
+        # Advance time — use a partial step if a full step_size doesn't fit.
+        # This matches the old env which processes every day up to end_date.
         old_time_index    = self._time_index
-        self._time_index += self._step_size
+        self._time_index  = min(self._time_index + self._step_size, last_idx)
         close_idx         = self.columns_map[self._valuation_feature]
 
+        # Record a daily portfolio value for every day in the window.
+        # Holdings are fixed after the trade, so daily_pv = balance + sum(h * day_prices).
         for day in range(old_time_index + 1, self._time_index + 1):
-            if day >= len(self._sorted_times):
-                break
             m = self._time_to_matrix_idx[self._sorted_times[day]]
             day_prices = np.nan_to_num(self.data_matrix[:, m, close_idx], nan=0.0)
             self._daily_portfolio_values.append(
@@ -234,7 +235,7 @@ class PortfolioAllocationEnv(gym.Env):
             )
             self._daily_dates.append(self._sorted_times[day])
 
-        # New prices after step_size days
+        # New prices after advancing
         new_prices  = self._get_prices(self._time_index)
         pv_after    = self._balance + float(np.nansum(self._holdings * new_prices))
         self._portfolio_value = pv_after
@@ -253,6 +254,12 @@ class PortfolioAllocationEnv(gym.Env):
         self._actions_memory.append(np.array(action, dtype=np.float32).flatten()[:self.portfolio_size])
 
         self._reward = portfolio_reward
+
+        # Check if we've reached the end after this step
+        self._terminal = (self._time_index >= last_idx)
+        if self._terminal:
+            return self._handle_terminal()
+
         obs          = self._get_obs()
         self._info   = self._build_info()
 

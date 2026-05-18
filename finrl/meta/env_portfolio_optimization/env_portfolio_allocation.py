@@ -5,12 +5,18 @@ Mirrors PortfolioOptimizationEnv structure (memory, terminal metrics, plots) whi
 adding configurable step_size, all 4 action types, and Dict observation space
 compatible with YFDagger's flatten_obs utility.
 
-Action types
-------------
-- weights      : Box(0, 1, n_stocks)  — target portfolio weight per stock
-- continuous   : Box(-1, 1, n_stocks) — signed trade intensity (−1 full sell, +1 max buy)
-- directions   : MultiDiscrete([3]*n)  — {−1 sell, 0 hold, +1 buy} (raw −1/0/+1)
-- multidiscrete: MultiDiscrete([11]*n) — graded signal in [−5, +5] (raw integers)
+Supports two modes:
+- mode="il"  (default): Dict observation, step_size=91, multidiscrete/etc actions,
+  log-return reward. This is the original behavior used by train.py / evaluate.py.
+- mode="drl": Flat 1D Box observation, step_size=1, continuous Box(-1,1) action space,
+  dollar P&L reward, sell-first-sorted execution matching StockTradingEnv exactly.
+
+Action types (IL mode)
+----------------------
+- weights      : Box(0, 1, n_stocks)  -- target portfolio weight per stock
+- continuous   : Box(-1, 1, n_stocks) -- signed trade intensity
+- directions   : MultiDiscrete([3]*n) -- {-1 sell, 0 hold, +1 buy}
+- multidiscrete: MultiDiscrete([11]*n) -- graded signal in [-5, +5]
 """
 
 from __future__ import annotations
@@ -38,10 +44,10 @@ except ModuleNotFoundError:
 
 
 class PortfolioAllocationEnv(gym.Env):
-    """Portfolio allocation gymnasium environment for IL+DAgger training.
+    """Portfolio allocation gymnasium environment for IL+DAgger and DRL training.
 
     Accepts a long-format DataFrame (same format as FinRL's PortfolioOptimizationEnv)
-    and exposes a Dict observation space compatible with the flatten_obs utility.
+    and exposes either a Dict or flat Box observation space depending on mode.
 
     Parameters
     ----------
@@ -54,15 +60,18 @@ class PortfolioAllocationEnv(gym.Env):
     end_date : str
         Active window end date (YYYY-MM-DD).
     step_size : int
-        Number of trading days between portfolio rebalancing decisions. Default 91 (≈ quarter).
+        Number of trading days between decisions. Default 91 (quarter).
+        Ignored when mode="drl" (forced to 1).
     action_type : str
         One of "weights", "continuous", "directions", "multidiscrete".
+        Ignored when mode="drl" (forced to continuous Box).
     initial_amount : float
         Starting cash in portfolio. Default 1_000_000.
     comission_fee_pct : float
         Transaction cost as a fraction (e.g. 0.002 = 0.2%). Default 0.002.
+        Used in IL mode. In DRL mode, buy_cost_pct/sell_cost_pct take precedence.
     reward_scaling : float
-        Scalar multiplied by the log-return reward. Default 1.0.
+        Scalar multiplied by the reward. Default 1.0.
     time_column : str
         Name of the date column in df. Default "date".
     tic_column : str
@@ -74,6 +83,26 @@ class PortfolioAllocationEnv(gym.Env):
     new_gym_api : bool
         If True, step() returns (obs, reward, terminated, truncated, info).
         If False, returns (obs, reward, done, info). Default True.
+    mode : str
+        "il" (default) for IL/DAgger pipeline, "drl" for StockTradingEnv-compatible mode.
+    hmax : int
+        Maximum shares per trade action in DRL mode. Default 1000.
+    num_stock_shares : list[int] or None
+        Initial holdings per stock. Default None (all zeros).
+    buy_cost_pct : list[float] or None
+        Per-stock buy commission in DRL mode. Default None -> [0.001]*stock_dim.
+    sell_cost_pct : list[float] or None
+        Per-stock sell commission in DRL mode. Default None -> [0.001]*stock_dim.
+    turbulence_threshold : float or None
+        Turbulence cutoff (not fully implemented). Default None.
+    risk_indicator_col : str
+        Column name for turbulence indicator. Default "turbulence".
+    print_verbosity : int
+        Print terminal stats every N episodes in DRL mode. Default 10.
+    initial : bool
+        True = fresh start, False = continue from previous_state. Default True.
+    previous_state : list or None
+        State from a previous window for rolling evaluation. Default None.
     """
 
     metadata = {"render_modes": ["human"]}
@@ -98,6 +127,17 @@ class PortfolioAllocationEnv(gym.Env):
         cwd: str = "./results/",
         new_gym_api: bool = True,
         render_mode=None,
+        # --- DRL mode parameters ---
+        mode: str = "il",
+        hmax: int = 1000,
+        num_stock_shares: list[int] | None = None,
+        buy_cost_pct: list[float] | None = None,
+        sell_cost_pct: list[float] | None = None,
+        turbulence_threshold: float | None = None,
+        risk_indicator_col: str = "turbulence",
+        print_verbosity: int = 10,
+        initial: bool = True,
+        previous_state: list | None = None,
     ):
         super().__init__()
 
@@ -105,7 +145,6 @@ class PortfolioAllocationEnv(gym.Env):
         self._features         = list(features)
         self._start_date       = start_date
         self._end_date         = end_date
-        self._step_size        = step_size
         self.action_type       = action_type
         self._initial_amount   = float(initial_amount)
         self._comission_fee_pct = comission_fee_pct
@@ -116,6 +155,21 @@ class PortfolioAllocationEnv(gym.Env):
         self._new_gym_api      = new_gym_api
         self.render_mode       = render_mode
 
+        # DRL mode configuration
+        self._mode             = mode
+        self._hmax             = hmax
+        self._turbulence_threshold = turbulence_threshold
+        self._risk_indicator_col   = risk_indicator_col
+        self._print_verbosity  = print_verbosity
+        self._initial          = initial
+        self._previous_state   = previous_state
+
+        # In DRL mode, force step_size=1
+        if self._mode == "drl":
+            self._step_size = 1
+        else:
+            self._step_size = step_size
+
         self._cwd          = Path(cwd)
         self._results_file = self._cwd / "results" / "rl"
         self._results_file.mkdir(parents=True, exist_ok=True)
@@ -123,11 +177,31 @@ class PortfolioAllocationEnv(gym.Env):
         # Build full data_matrix from df (all dates), populate _tic_list, columns_map
         self._build_data_matrix()
 
+        # DRL mode: per-stock commission lists
+        if self._mode == "drl":
+            n = self.portfolio_size
+            self._buy_cost_pct  = buy_cost_pct  if buy_cost_pct  is not None else [0.001] * n
+            self._sell_cost_pct = sell_cost_pct if sell_cost_pct is not None else [0.001] * n
+            self._num_stock_shares = (
+                list(num_stock_shares) if num_stock_shares is not None
+                else [0] * n
+            )
+        else:
+            self._buy_cost_pct  = buy_cost_pct
+            self._sell_cost_pct = sell_cost_pct
+            self._num_stock_shares = (
+                list(num_stock_shares) if num_stock_shares is not None
+                else [0] * self.portfolio_size
+            )
+
         # Set active sorted_times to [start_date, end_date]
         self._update_sorted_times(start_date, end_date)
 
         # Define spaces
         self._build_spaces()
+
+        # Episode counter (DRL mode uses this for print_verbosity)
+        self.episode = 0
 
         # Initialise memory & state
         self._reset_memory()
@@ -137,6 +211,12 @@ class PortfolioAllocationEnv(gym.Env):
         self._terminal      = False
         self._reward        = 0.0
         self._info          = {}
+
+        # DRL mode: track cost and trades like StockTradingEnv
+        if self._mode == "drl":
+            self.cost   = 0.0
+            self.trades = 0
+            self.turbulence = 0
 
     # ================================================================ #
     #  Public API (mirrors PortfolioOptimizationEnv + YFDagger compat) #
@@ -158,7 +238,7 @@ class PortfolioAllocationEnv(gym.Env):
         self._start_date = start_date
         self._end_date   = end_date
         self._update_sorted_times(start_date, end_date)
-        print(f"Dates set to: {start_date} → {end_date}")
+        print(f"Dates set to: {start_date} -> {end_date}")
 
     def set_start(self, offset: int) -> None:
         """Advance _time_index by offset steps (for diverse DAgger rollouts)."""
@@ -180,6 +260,52 @@ class PortfolioAllocationEnv(gym.Env):
         return e, obs
 
     # ================================================================ #
+    #  StockTradingEnv-compatible memory API (DRL mode)                #
+    # ================================================================ #
+
+    def save_asset_memory(self) -> pd.DataFrame:
+        """Return DataFrame with columns ['date', 'account_value'].
+
+        Compatible with StockTradingEnv.save_asset_memory().
+        Works in both IL and DRL mode.
+        """
+        if self._mode == "drl":
+            return pd.DataFrame({
+                "date":          self._date_memory,
+                "account_value": self._drl_asset_memory,
+            })
+        else:
+            # IL mode: use daily_portfolio_values for full daily granularity
+            return pd.DataFrame({
+                "date":          self._daily_dates,
+                "account_value": self._daily_portfolio_values,
+            })
+
+    def save_action_memory(self) -> pd.DataFrame:
+        """Return DataFrame with dates as index and ticker names as columns.
+
+        Compatible with StockTradingEnv.save_action_memory().
+        """
+        if self._mode == "drl":
+            date_list   = self._date_memory[:-1]
+            df_date     = pd.DataFrame(date_list, columns=["date"])
+            df_actions  = pd.DataFrame(self._actions_memory)
+            if len(df_actions.columns) == self.portfolio_size:
+                df_actions.columns = self._tic_list
+            df_actions.index = df_date["date"]
+            return df_actions
+        else:
+            # IL mode: best effort
+            date_list   = self._date_memory[:-1]
+            df_date     = pd.DataFrame(date_list, columns=["date"])
+            df_actions  = pd.DataFrame(self._actions_memory[1:])  # skip initial zeros
+            if len(df_actions.columns) == self.portfolio_size:
+                df_actions.columns = self._tic_list
+            if len(df_date) == len(df_actions):
+                df_actions.index = df_date["date"]
+            return df_actions
+
+    # ================================================================ #
     #  gymnasium.Env interface                                          #
     # ================================================================ #
 
@@ -187,21 +313,71 @@ class PortfolioAllocationEnv(gym.Env):
         super().reset(seed=seed)
 
         self._time_index    = 0
-        self._holdings      = np.zeros(self.portfolio_size, dtype=np.float64)
         self._balance       = self._initial_amount
         self._portfolio_value = self._initial_amount
         self._terminal      = False
         self._reward        = 0.0
-        self._reset_memory()
 
-        obs        = self._get_obs()
-        self._info = self._build_info()
+        if self._mode == "drl":
+            # DRL mode: support initial/previous_state like StockTradingEnv
+            self._holdings = np.array(self._num_stock_shares, dtype=np.float64)
 
-        if self._new_gym_api:
-            return obs, self._info
-        return obs
+            if self._initial:
+                # Initial total asset = cash + stock value
+                prices = self._get_prices(0)
+                initial_asset = self._initial_amount + float(
+                    np.sum(np.array(self._num_stock_shares) * prices)
+                )
+            else:
+                if self._previous_state is not None:
+                    # Reconstruct from previous_state
+                    n = self.portfolio_size
+                    self._balance = self._previous_state[0]
+                    self._holdings = np.array(
+                        self._previous_state[(n + 1):(n * 2 + 1)], dtype=np.float64
+                    )
+                prices = self._get_prices(0)
+                initial_asset = self._balance + float(np.sum(self._holdings * prices))
+
+            self._portfolio_value = initial_asset
+            self._reset_memory_drl(initial_asset)
+
+            self.cost   = 0.0
+            self.trades = 0
+            self.turbulence = 0
+            self.episode += 1
+
+            obs = self._get_obs()
+            return obs, {}
+        else:
+            # IL mode: original behavior
+            self._holdings = np.zeros(self.portfolio_size, dtype=np.float64)
+            self._reset_memory()
+
+            obs        = self._get_obs()
+            self._info = self._build_info()
+
+            if self._new_gym_api:
+                return obs, self._info
+            return obs
 
     def step(self, action):
+        if self._mode == "drl":
+            return self._step_drl(action)
+        else:
+            return self._step_il(action)
+
+    def render(self, mode="human"):
+        return self._get_obs()
+
+    def close(self):
+        pass
+
+    # ================================================================ #
+    #  IL mode step (original behavior, unchanged)                     #
+    # ================================================================ #
+
+    def _step_il(self, action):
         last_idx = len(self._sorted_times) - 1
 
         # Terminal: already at the last tradeable day
@@ -219,7 +395,7 @@ class PortfolioAllocationEnv(gym.Env):
         share_deltas = self._action_fix(action, prices)
         self._execute_trades(share_deltas, prices)
 
-        # Advance time — use a partial step if a full step_size doesn't fit.
+        # Advance time -- use a partial step if a full step_size doesn't fit.
         # This matches the old env which processes every day up to end_date.
         old_time_index    = self._time_index
         self._time_index  = min(self._time_index + self._step_size, last_idx)
@@ -267,14 +443,121 @@ class PortfolioAllocationEnv(gym.Env):
             return obs, self._reward, False, False, self._info
         return obs, self._reward, False, self._info
 
-    def render(self, mode="human"):
-        return self._get_obs()
+    # ================================================================ #
+    #  DRL mode step (StockTradingEnv-compatible)                      #
+    # ================================================================ #
 
-    def close(self):
-        pass
+    def _step_drl(self, actions):
+        last_idx = len(self._sorted_times) - 1
+        self._terminal = self._time_index >= last_idx
+
+        if self._terminal:
+            return self._handle_terminal_drl()
+
+        # Scale and cast actions exactly as StockTradingEnv does
+        actions = np.asarray(actions, dtype=np.float64).flatten()[:self.portfolio_size]
+        actions = (actions * self._hmax).astype(int)
+
+        # Turbulence override
+        if self._turbulence_threshold is not None:
+            if self.turbulence >= self._turbulence_threshold:
+                actions = np.array([-self._hmax] * self.portfolio_size)
+
+        # Begin total asset
+        prices = self._get_prices(self._time_index)
+        begin_total_asset = self._balance + float(np.sum(self._holdings * prices))
+
+        # Sell-first-sorted execution (matches StockTradingEnv exactly)
+        argsort_actions = np.argsort(actions)
+        sell_index = argsort_actions[: np.where(actions < 0)[0].shape[0]]
+        buy_index  = argsort_actions[::-1][: np.where(actions > 0)[0].shape[0]]
+
+        for index in sell_index:
+            actions[index] = self._sell_stock_drl(index, actions[index]) * (-1)
+
+        for index in buy_index:
+            actions[index] = self._buy_stock_drl(index, actions[index])
+
+        self._actions_memory.append(actions.copy())
+
+        # Advance one day
+        self._time_index += 1
+
+        # Update turbulence if applicable
+        if self._turbulence_threshold is not None:
+            if self._risk_indicator_col in self.columns_map:
+                m_idx = self._time_to_matrix_idx[self._sorted_times[self._time_index]]
+                turb_idx = self.columns_map[self._risk_indicator_col]
+                turb_val = self.data_matrix[0, m_idx, turb_idx]
+                self.turbulence = float(np.nan_to_num(turb_val, nan=0.0))
+
+        # End total asset with new prices
+        new_prices = self._get_prices(self._time_index)
+        end_total_asset = self._balance + float(np.sum(self._holdings * new_prices))
+
+        self._drl_asset_memory.append(end_total_asset)
+        self._date_memory.append(self._get_current_date())
+
+        # Dollar P&L reward (same as StockTradingEnv)
+        reward = end_total_asset - begin_total_asset
+        self._drl_rewards_memory.append(reward)
+        self._reward = reward * self._reward_scaling
+
+        self._portfolio_value = end_total_asset
+
+        # Also track daily PV for metrics (used by save_asset_memory / terminal)
+        self._daily_portfolio_values.append(end_total_asset)
+        self._daily_dates.append(self._sorted_times[self._time_index])
+
+        obs = self._get_obs()
+        return obs, self._reward, False, False, {}
+
+    def _sell_stock_drl(self, index: int, action: int) -> int:
+        """Sell stock at given index. Returns number of shares actually sold.
+
+        Matches StockTradingEnv._sell_stock (normal path, no turbulence liquidation).
+        """
+        prices = self._get_prices(self._time_index)
+        price = prices[index]
+
+        if price <= 0:
+            return 0
+
+        if self._holdings[index] > 0:
+            sell_num_shares = min(abs(action), self._holdings[index])
+            sell_amount = price * sell_num_shares * (1 - self._sell_cost_pct[index])
+            self._balance += sell_amount
+            self._holdings[index] -= sell_num_shares
+            self.cost += price * sell_num_shares * self._sell_cost_pct[index]
+            self.trades += 1
+        else:
+            sell_num_shares = 0
+
+        return int(sell_num_shares)
+
+    def _buy_stock_drl(self, index: int, action: int) -> int:
+        """Buy stock at given index. Returns number of shares actually bought.
+
+        Matches StockTradingEnv._buy_stock (floor-division available amount).
+        """
+        prices = self._get_prices(self._time_index)
+        price = prices[index]
+
+        if price <= 0:
+            return 0
+
+        available_amount = self._balance // (price * (1 + self._buy_cost_pct[index]))
+        buy_num_shares = min(available_amount, action)
+        buy_amount = price * buy_num_shares * (1 + self._buy_cost_pct[index])
+        self._balance -= buy_amount
+        self._holdings[index] += buy_num_shares
+        self.cost += price * buy_num_shares * self._buy_cost_pct[index]
+        self.trades += 1
+
+        return int(buy_num_shares)
 
     # ================================================================ #
-    #  Terminal handling (mirrors PortfolioOptimizationEnv)            #
+    #  Terminal handling — IL mode (original behavior)                  #
     # ================================================================ #
 
     def _handle_terminal(self):
@@ -287,7 +570,7 @@ class PortfolioAllocationEnv(gym.Env):
         years  = n_days / 252.0
         annual_return = (final_pv / max(initial_pv, 1e-10)) ** (1 / max(years, 1e-10)) - 1
 
-        # Daily series — correct Sharpe regardless of step_size (periods=252 = daily default)
+        # Daily series -- correct Sharpe regardless of step_size (periods=252 = daily default)
         daily_pv_series = pd.Series(
             self._daily_portfolio_values,
             index=pd.DatetimeIndex(self._daily_dates),
@@ -359,11 +642,49 @@ class PortfolioAllocationEnv(gym.Env):
         return obs, self._reward, True, info
 
     # ================================================================ #
+    #  Terminal handling — DRL mode (StockTradingEnv-compatible)        #
+    # ================================================================ #
+
+    def _handle_terminal_drl(self):
+        """Terminal handler for DRL mode. Prints stats per print_verbosity."""
+        prices = self._get_prices(self._time_index)
+        end_total_asset = self._balance + float(np.sum(self._holdings * prices))
+
+        df_total_value = pd.DataFrame(self._drl_asset_memory, columns=["account_value"])
+        df_total_value["date"] = self._date_memory
+        df_total_value["daily_return"] = df_total_value["account_value"].pct_change(1)
+
+        tot_reward = end_total_asset - self._drl_asset_memory[0]
+
+        if df_total_value["daily_return"].std() != 0:
+            sharpe = (
+                (252**0.5)
+                * df_total_value["daily_return"].mean()
+                / df_total_value["daily_return"].std()
+            )
+        else:
+            sharpe = 0.0
+
+        if self.episode % self._print_verbosity == 0:
+            print(f"day: {self._time_index}, episode: {self.episode}")
+            print(f"begin_total_asset: {self._drl_asset_memory[0]:0.2f}")
+            print(f"end_total_asset: {end_total_asset:0.2f}")
+            print(f"total_reward: {tot_reward:0.2f}")
+            print(f"total_cost: {self.cost:0.2f}")
+            print(f"total_trades: {self.trades}")
+            if df_total_value["daily_return"].std() != 0:
+                print(f"Sharpe: {sharpe:0.3f}")
+            print("=================================")
+
+        obs = self._get_obs()
+        return obs, self._reward, True, False, {}
+
+    # ================================================================ #
     #  Memory                                                           #
     # ================================================================ #
 
     def _reset_memory(self):
-        """Mirrors PortfolioOptimizationEnv._reset_memory()."""
+        """Mirrors PortfolioOptimizationEnv._reset_memory(). Used in IL mode."""
         date_time = self._sorted_times[0] if self._sorted_times else None
         self._asset_memory = {
             "initial": [self._initial_amount],
@@ -375,12 +696,25 @@ class PortfolioAllocationEnv(gym.Env):
         self._final_weights  = [np.zeros(self.portfolio_size, dtype=np.float32)]
         self._date_memory    = [date_time]
 
-        # Daily series — one entry per trading day (used for correct Sharpe/drawdown)
+        # Daily series -- one entry per trading day (used for correct Sharpe/drawdown)
         self._daily_portfolio_values = [self._initial_amount]
         self._daily_dates            = [date_time]
 
         if not hasattr(self, "_reward_type"):
             self._reward_type = "log_return"
+
+    def _reset_memory_drl(self, initial_asset: float):
+        """Reset memory for DRL mode. Flat lists matching StockTradingEnv."""
+        self._drl_asset_memory   = [initial_asset]
+        self._drl_rewards_memory = []
+        self._actions_memory     = []
+        self._drl_state_memory   = []
+        self._date_memory        = [self._get_current_date()]
+
+        # Also maintain daily PV series for metrics
+        self._daily_portfolio_values = [initial_asset]
+        date_time = self._sorted_times[0] if self._sorted_times else None
+        self._daily_dates = [date_time]
 
     # ================================================================ #
     #  Data matrix construction                                        #
@@ -446,7 +780,7 @@ class PortfolioAllocationEnv(gym.Env):
         if not self._sorted_times:
             raise ValueError(
                 f"No data between {start_date} and {end_date}. "
-                f"Available range: {self._all_times[0]} – {self._all_times[-1]}"
+                f"Available range: {self._all_times[0]} -- {self._all_times[-1]}"
             )
 
     # ================================================================ #
@@ -457,30 +791,50 @@ class PortfolioAllocationEnv(gym.Env):
         """Build gymnasium action and observation spaces for the current active window."""
         n = self.portfolio_size
 
-        # Action space
-        if self.action_type == "weights":
-            self.action_space = spaces.Box(low=0.0,  high=1.0, shape=(n,), dtype=np.float32)
-        elif self.action_type == "continuous":
-            self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(n,), dtype=np.float32)
-        elif self.action_type == "directions":
-            self.action_space = spaces.MultiDiscrete(np.array([3] * n), dtype=np.int32)
-        elif self.action_type == "multidiscrete":
-            self.action_space = spaces.MultiDiscrete(np.array([11] * n), dtype=np.int32)
+        if self._mode == "drl":
+            # DRL mode: continuous Box action, flat Box observation
+            self.action_space = spaces.Box(
+                low=-1.0, high=1.0, shape=(n,), dtype=np.float32
+            )
+            # State: [cash, close_1..N, shares_1..N, feat1_1..N, feat2_1..N, ...]
+            # features used in observation (those present in data_matrix)
+            self._drl_features = [f for f in self._features if f in self.columns_map]
+            state_dim = 1 + 2 * n + len(self._drl_features) * n
+            self.observation_space = spaces.Box(
+                low=-np.inf, high=np.inf, shape=(state_dim,), dtype=np.float32
+            )
         else:
-            raise ValueError(f"Unknown action_type: {self.action_type!r}")
+            # IL mode: original behavior
+            if self.action_type == "weights":
+                self.action_space = spaces.Box(low=0.0,  high=1.0, shape=(n,), dtype=np.float32)
+            elif self.action_type == "continuous":
+                self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(n,), dtype=np.float32)
+            elif self.action_type == "directions":
+                self.action_space = spaces.MultiDiscrete(np.array([3] * n), dtype=np.int32)
+            elif self.action_type == "multidiscrete":
+                self.action_space = spaces.MultiDiscrete(np.array([11] * n), dtype=np.int32)
+            else:
+                raise ValueError(f"Unknown action_type: {self.action_type!r}")
 
-        # Observation space: feature dict + portfolio weights (h) + cash ratio (b)
-        obs_dict = {
-            feat: spaces.Box(low=-4.0, high=4.0, shape=(n,), dtype=np.float32)
-            for feat in self._features
-            if feat in self.columns_map
-        }
-        obs_dict["h"] = spaces.Box(low=0.0, high=1.0, shape=(n,),  dtype=np.float32)
-        obs_dict["b"] = spaces.Box(low=0.0, high=1.0, shape=(1,),  dtype=np.float32)
-        self.observation_space = spaces.Dict(obs_dict)
+            # Observation space: feature dict + portfolio weights (h) + cash ratio (b)
+            obs_dict = {
+                feat: spaces.Box(low=-4.0, high=4.0, shape=(n,), dtype=np.float32)
+                for feat in self._features
+                if feat in self.columns_map
+            }
+            obs_dict["h"] = spaces.Box(low=0.0, high=1.0, shape=(n,),  dtype=np.float32)
+            obs_dict["b"] = spaces.Box(low=0.0, high=1.0, shape=(1,),  dtype=np.float32)
+            self.observation_space = spaces.Dict(obs_dict)
 
-    def _get_obs(self) -> dict:
-        """Build the current Dict observation."""
+    def _get_obs(self):
+        """Build the current observation (Dict for IL, flat list for DRL)."""
+        if self._mode == "drl":
+            return self._get_obs_drl()
+        else:
+            return self._get_obs_il()
+
+    def _get_obs_il(self) -> dict:
+        """Build the current Dict observation (IL mode)."""
         t_idx = min(self._time_index, len(self._sorted_times) - 1)
         m_idx = self._time_to_matrix_idx[self._sorted_times[t_idx]]
 
@@ -503,6 +857,34 @@ class PortfolioAllocationEnv(gym.Env):
             obs["b"] = np.array([1.0], dtype=np.float32)
 
         return obs
+
+    def _get_obs_drl(self) -> list:
+        """Build flat 1D observation (DRL mode).
+
+        Layout: [cash, close_1..N, shares_1..N, feat1_1..N, feat2_1..N, ...]
+        Matches StockTradingEnv state layout exactly.
+
+        Returns a Python list (same as StockTradingEnv._update_state()) to
+        preserve float64 precision on large values like cash balance.
+        SB3's DummyVecEnv handles conversion to numpy arrays internally.
+        """
+        t_idx = min(self._time_index, len(self._sorted_times) - 1)
+        m_idx = self._time_to_matrix_idx[self._sorted_times[t_idx]]
+
+        close_idx = self.columns_map[self._valuation_feature]
+        close_prices = np.nan_to_num(
+            self.data_matrix[:, m_idx, close_idx], nan=0.0
+        )
+
+        state = [self._balance]
+        state += close_prices.tolist()
+        state += self._holdings.tolist()
+
+        for feat in self._drl_features:
+            vals = self.data_matrix[:, m_idx, self.columns_map[feat]]
+            state += np.nan_to_num(vals, nan=0.0).tolist()
+
+        return state
 
     def _build_info(self) -> dict:
         t_idx  = min(self._time_index, len(self._sorted_times) - 1)
@@ -528,8 +910,13 @@ class PortfolioAllocationEnv(gym.Env):
             "sharpe_ratio":    0.0,
         }
 
+    def _get_current_date(self):
+        """Return the current date (for DRL mode memory tracking)."""
+        t_idx = min(self._time_index, len(self._sorted_times) - 1)
+        return self._sorted_times[t_idx]
+
     # ================================================================ #
-    #  Trading helpers                                                 #
+    #  Trading helpers (IL mode)                                       #
     # ================================================================ #
 
     def _get_prices(self, time_index: int) -> np.ndarray:
@@ -543,7 +930,7 @@ class PortfolioAllocationEnv(gym.Env):
         """
         Convert model action to integer share-count deltas.
 
-        Ported from YFDagger._action_fix (env.py lines 341–362).
+        Ported from YFDagger._action_fix (env.py lines 341-362).
         Returns an array of shape (portfolio_size,) with integer deltas.
         """
         action = np.asarray(action, dtype=np.float64).flatten()[:self.portfolio_size]
@@ -574,7 +961,7 @@ class PortfolioAllocationEnv(gym.Env):
         """
         Execute sells then buys, applying comission_fee_pct.
 
-        Ported from YFDagger._get_reward_and_state (env.py lines 380–411).
+        Ported from YFDagger._get_reward_and_state (env.py lines 380-411).
         Modifies self._holdings and self._balance in-place.
         """
         needed_to_buy: float = 0.0

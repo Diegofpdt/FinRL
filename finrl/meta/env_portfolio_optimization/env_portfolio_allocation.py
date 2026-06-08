@@ -167,6 +167,10 @@ class PortfolioAllocationEnv(gym.Env):
         self._turbulence = 0
         self._cost = 0
         self._trades = 0
+        self._infeasible_sells = 0
+        self._clipped_sells = 0
+        self._infeasible_buys = 0
+        self._clipped_buys = 0
         self._info = {}
 
         self._seed()
@@ -246,6 +250,10 @@ class PortfolioAllocationEnv(gym.Env):
         self._turbulence = 0
         self._cost = 0
         self._trades = 0
+        self._infeasible_sells = 0
+        self._clipped_sells = 0
+        self._infeasible_buys = 0
+        self._clipped_buys = 0
 
         self._reset_memory()
 
@@ -402,6 +410,10 @@ class PortfolioAllocationEnv(gym.Env):
         print(f"Sharpe ratio:            {sharpe:.4f}")
         print(f"Total cost of transactions: {self._cost:.4f}")
         print(f"Number of trades: {self._trades:.4f}")
+        print(f"Infeasible sells (no holdings): {self._infeasible_sells}")
+        print(f"Clipped sells (partial):        {self._clipped_sells}")
+        print(f"Infeasible buys (no cash):      {self._infeasible_buys}")
+        print(f"Clipped buys (partial):         {self._clipped_buys}")
         print("=================================")
 
         # Save plots
@@ -442,6 +454,12 @@ class PortfolioAllocationEnv(gym.Env):
         info["annual_return"] = annual_return
         info["sharpe_ratio"] = sharpe
         info["daily_pv_series"] = daily_pv_series
+        info["transaction_cost"] = self._cost
+        info["num_trades"] = self._trades
+        info["infeasible_sells"] = self._infeasible_sells
+        info["clipped_sells"] = self._clipped_sells
+        info["infeasible_buys"] = self._infeasible_buys
+        info["clipped_buys"] = self._clipped_buys
         obs = self._get_obs()
 
         if self._new_gym_api:
@@ -691,7 +709,11 @@ class PortfolioAllocationEnv(gym.Env):
         Proceeds are net of sell_cost_pct[index]. Cannot sell more than held.
         """
         if self._holdings[index] <= 0:
+            self._infeasible_sells += 1
             return
+
+        if amount > self._holdings[index]:
+            self._clipped_sells += 1
 
         sell_shares = min(amount, self._holdings[index])
         sell_proceeds = price * sell_shares * (1 - self._sell_cost_pct[index]) # minus the specified stock cost of selling the share
@@ -712,7 +734,11 @@ class PortfolioAllocationEnv(gym.Env):
         buy_shares = min(amount, affordable)
 
         if buy_shares <= 0:
+            self._infeasible_buys += 1
             return
+
+        if amount > affordable:
+            self._clipped_buys += 1
 
         buy_cost = price * buy_shares * (1 + self._buy_cost_pct[index])
 

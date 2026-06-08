@@ -106,11 +106,13 @@ class PortfolioAllocationEnv(gym.Env):
         new_gym_api: bool = True,
         render_mode=None,
         model_name: str = "", #STOCKTRADING
+        include_portfolio_state: bool = True,
     ):
         super().__init__()
 
         self._df = df.copy()
         self._features = list(features)
+        self._include_portfolio_state = include_portfolio_state
         self._start_date = start_date
         self._end_date = end_date
         self._buy_cost_pct = buy_cost_pct
@@ -558,7 +560,10 @@ class PortfolioAllocationEnv(gym.Env):
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(n,), dtype=np.float32)
 
         feat_count = len([f for f in self._features if f in self.columns_map])
-        self.state_dimension_number = n * feat_count + n + 1
+        if self._include_portfolio_state:
+            self.state_dimension_number = n * feat_count + n + 1  # features + holdings + cash
+        else:
+            self.state_dimension_number = n * feat_count           # signals only
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -591,13 +596,15 @@ class PortfolioAllocationEnv(gym.Env):
         prices = np.nan_to_num(prices, nan=0)
         pv = self._balance + float(np.sum(self._holdings * prices))
 
-        if pv > 0:
-            weights = self._holdings * prices / pv
-            obs[offset:offset + self.portfolio_size] = weights.astype(np.float32) # holdings
-            obs[-1] = np.float32(self._balance / pv) # cash ratio
-        else:
-            obs[offset:offset + self.portfolio_size] = np.zeros(self.portfolio_size, dtype=np.float32)
-            obs[-1] = np.float32(1.0)
+        # Portfolio state (holdings + cash) — omitted in signal-only mode
+        if self._include_portfolio_state:
+            if pv > 0:
+                weights = self._holdings * prices / pv
+                obs[offset:offset + self.portfolio_size] = weights.astype(np.float32)
+                obs[-1] = np.float32(self._balance / pv)
+            else:
+                obs[offset:offset + self.portfolio_size] = np.zeros(self.portfolio_size, dtype=np.float32)
+                obs[-1] = np.float32(1.0)
 
         return obs
 

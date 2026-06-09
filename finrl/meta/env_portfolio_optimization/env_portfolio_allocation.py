@@ -27,6 +27,8 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import scipy.cluster.hierarchy as sch
+from scipy.spatial.distance import squareform
 
 from gymnasium import spaces
 from gymnasium.utils import seeding
@@ -171,6 +173,8 @@ class PortfolioAllocationEnv(gym.Env):
         self._clipped_sells = 0
         self._infeasible_buys = 0
         self._clipped_buys = 0
+        self._hrp_forced_sells = 0
+        self._hrp_blocked_buys = 0
         self._info = {}
 
         self._seed()
@@ -254,6 +258,8 @@ class PortfolioAllocationEnv(gym.Env):
         self._clipped_sells = 0
         self._infeasible_buys = 0
         self._clipped_buys = 0
+        self._hrp_forced_sells = 0
+        self._hrp_blocked_buys = 0
 
         self._reset_memory()
 
@@ -292,6 +298,11 @@ class PortfolioAllocationEnv(gym.Env):
         share_deltas = action * self._K
         share_deltas = share_deltas.astype(int) # convert action into integer
         share_deltas = np.nan_to_num(share_deltas, nan=0)
+
+        # Enforce HRP weight caps: block buys and force sells that breach caps
+        m_idx = self._time_to_matrix_idx[self._sorted_times[self._time_index]]
+        hrp_caps = self.hrp(m_idx)
+        share_deltas = self._apply_hrp_caps(share_deltas, prices, pv_before, hrp_caps)
 
         self._execute_trades(share_deltas, prices)
 
@@ -414,6 +425,8 @@ class PortfolioAllocationEnv(gym.Env):
         print(f"Clipped sells (partial):        {self._clipped_sells}")
         print(f"Infeasible buys (no cash):      {self._infeasible_buys}")
         print(f"Clipped buys (partial):         {self._clipped_buys}")
+        print(f"HRP forced sells (over cap):    {self._hrp_forced_sells}")
+        print(f"HRP blocked buys (cap reached): {self._hrp_blocked_buys}")
         print("=================================")
 
         # Save plots
@@ -460,6 +473,8 @@ class PortfolioAllocationEnv(gym.Env):
         info["clipped_sells"] = self._clipped_sells
         info["infeasible_buys"] = self._infeasible_buys
         info["clipped_buys"] = self._clipped_buys
+        info["hrp_forced_sells"] = self._hrp_forced_sells
+        info["hrp_blocked_buys"] = self._hrp_blocked_buys
         obs = self._get_obs()
 
         if self._new_gym_api:
@@ -760,6 +775,143 @@ class PortfolioAllocationEnv(gym.Env):
         m_idx = self._time_to_matrix_idx[self._sorted_times[t_idx]]
         flag = self.data_matrix[stock_index, m_idx, self.columns_map[self._tradeable_col]]
         return flag != 1.0
+
+    def _apply_hrp_caps(
+        self,
+        share_deltas: np.ndarray,
+        prices: np.ndarray,
+        pv: float,
+        hrp_caps: pd.Series,
+    ) -> np.ndarray:
+        """
+        Clip share_deltas so no stock's portfolio weight exceeds its HRP cap.
+
+        Two rules applied per stock:
+        - Current weight already above cap  → force sell enough shares to reach cap
+          (overrides the agent's delta if it would sell less or even buy)
+        - Buy intent but weight would exceed cap → clip buy to available headroom
+        """
+        if pv <= 0:
+            return share_deltas
+
+        deltas = share_deltas.copy()
+
+        for i, tic in enumerate(self._tic_list):
+            cap = float(hrp_caps[tic])
+            if cap >= 1.0 or prices[i] <= 0:   # no restriction or untradeable price
+                continue
+
+            current_weight = self._holdings[i] * prices[i] / pv
+
+            if current_weight > cap:
+                # Already over cap — force sell to bring weight back to cap
+                excess_value  = (current_weight - cap) * pv
+                excess_shares = math.ceil(excess_value / prices[i])
+                deltas[i] = min(deltas[i], -excess_shares)   # take the larger sell
+                self._hrp_forced_sells += 1
+
+            elif deltas[i] > 0:
+                # Buy intent — clip to the headroom remaining below cap
+                headroom_value  = (cap - current_weight) * pv
+                max_buy_shares  = int(headroom_value / (prices[i] * (1 + self._buy_cost_pct[i])))
+                if deltas[i] > max(0, max_buy_shares):
+                    self._hrp_blocked_buys += 1
+                deltas[i] = min(deltas[i], max(0, max_buy_shares))
+
+        return deltas
+
+    ## HRP (Hierarchical risk parity)
+    def hrp(self, time_index: int, lookback: int = 252) -> pd.Series:
+        """
+        Compute HRP weight caps from trailing close prices.
+
+        Steps: returns → correlation/covariance → distance → single-linkage
+        clustering → quasi-diagonalization → recursive bisection.
+
+        Returns a pd.Series of weights indexed by ticker, summing to 1.
+        These weights represent the maximum allowed portfolio weight per stock.
+        """
+        start_index = max(0, time_index - lookback)
+        prices = self.data_matrix[:, start_index:time_index, self.columns_map[self._valuation_feature]]
+
+        # Not enough history — return 1.0 per stock (no restriction on agent)
+        if prices.shape[1] < 30:
+            return pd.Series(1.0, index=self._tic_list)
+
+        returns = pd.DataFrame(prices.T, columns=self._tic_list).pct_change().dropna()
+
+        cov  = returns.cov()
+        corr = returns.corr()
+        dist = ((1 - corr) / 2) ** .5
+
+        # --- 1. Hierarchical clustering ---
+        link = sch.linkage(squareform(dist.values), 'single')
+
+        # --- 2. Quasi-diagonalization: reorder leaves so similar assets are adjacent ---
+        sort_ix = self._hrp_quasi_diag(link, len(self._tic_list))
+        sorted_tickers = [self._tic_list[i] for i in sort_ix]
+
+        # --- 3. Recursive bisection: assign weights inversely proportional to cluster variance ---
+        weights = self._hrp_rec_bisect(cov, sorted_tickers)
+
+        return weights
+
+    def _hrp_quasi_diag(self, link: np.ndarray, n_items: int) -> list:
+        """
+        Sort the dendrogram leaves so similar assets sit next to each other.
+        Returns an ordered list of original stock indices.
+        """
+        link = link.astype(int)
+        sort_ix = pd.Series([link[-1, 0], link[-1, 1]])
+
+        while sort_ix.max() >= n_items:
+            sort_ix.index = range(0, len(sort_ix) * 2, 2)   # make room
+            clusters = sort_ix[sort_ix >= n_items]           # non-leaf nodes
+            j = clusters.values - n_items                    # row in linkage
+            sort_ix[clusters.index]     = link[j, 0]         # left child
+            new_entries = pd.Series(link[j, 1], index=clusters.index + 1)  # right child
+            sort_ix = pd.concat([sort_ix, new_entries]).sort_index()
+            sort_ix.index = range(len(sort_ix))
+
+        return sort_ix.tolist()
+
+    def _hrp_rec_bisect(self, cov: pd.DataFrame, sorted_tickers: list) -> pd.Series:
+        """
+        Allocate weights by recursive bisection.
+        At each split, each half receives weight proportional to the inverse
+        of its cluster variance (IVP-weighted within the cluster).
+        """
+        weights = pd.Series(1.0, index=sorted_tickers)
+        clusters = [sorted_tickers]
+
+        while clusters:
+            # Split every current cluster into two halves
+            clusters = [
+                half
+                for cluster in clusters
+                for half in (cluster[:len(cluster) // 2], cluster[len(cluster) // 2:])
+                if len(cluster) > 1
+            ]
+            # Process pairs
+            for i in range(0, len(clusters), 2):
+                left, right = clusters[i], clusters[i + 1]
+                var_left  = self._hrp_cluster_var(cov, left)
+                var_right = self._hrp_cluster_var(cov, right)
+                alpha = 1.0 - var_left / (var_left + var_right)   # weight for left half
+                weights[left]  *= alpha
+                weights[right] *= 1.0 - alpha
+
+        return weights
+
+    def _hrp_cluster_var(self, cov: pd.DataFrame, tickers: list) -> float:
+        """
+        Variance of a cluster using inverse-variance portfolio weights.
+        w_i = (1/var_i) / sum(1/var_j),  cluster_var = w' Σ w
+        """
+        sub_cov = cov.loc[tickers, tickers]
+        ivp = 1.0 / np.diag(sub_cov.values)
+        ivp /= ivp.sum()
+        return float(ivp @ sub_cov.values @ ivp)
 
     def _seed(self, seed=None):
         """Initialise the numpy random state (Gymnasium seeding convention)."""
